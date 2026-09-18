@@ -1,10 +1,5 @@
 # Snaptron API -- confirmed findings from pre-hackathon recon
 
-This file is project memory, not instructions from the organizers. If the
-hackathon coordinators give a different brief, task, or scope on the day,
-their instructions take priority -- this file only exists so the agent
-doesn't re-discover bugs and syntax we already paid for in testing.
-
 Context: MCP server wrapping the Snaptron REST API
 (https://snaptron.cs.jhu.edu) for cancer/tissue RNA-seq questions
 (splice junctions, novel junctions, gene/exon usage, tumor vs normal,
