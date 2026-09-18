@@ -1,0 +1,8 @@
+# Core MCP server (snaptron_server.py)
+mcp>=2.0            # FastMCP was renamed to MCPServer in v2 -- this server uses the v2 API only, v1 will not work
+requests>=2.31
+pandas>=2.0
+
+# HTML dossier / report generators (html_gene_dossier.py, html_report_tissue_expression.py)
+plotly>=5.0
+numpy>=1.24

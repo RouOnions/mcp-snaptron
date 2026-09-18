@@ -1,0 +1,39 @@
+# Runtime-generated data -- every file in these is written fresh by
+# snaptron_server.py / html_gene_dossier.py / html_report_tissue_expression.py
+# on each call, never read back across a fresh checkout, and can be
+# regenerated at will. Not committed.
+outputs/
+plots/
+reports/
+scratch/
+
+# Internal task list from the original build -- not needed by anyone using
+# the finished server; CLAUDE.md and docs/ cover the parts worth publishing.
+BUILD_PLAN.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Local config / secrets. .claude/ holds this machine's session lock file
+# (scheduled_tasks.lock -- session id, PID, timestamps, nothing meant to be
+# shared) and any local settings; .env* are excluded defensively even
+# though none currently exist in this repo, so one is never committed by
+# accident later.
+.claude/
+.env
+.env.*
+*.local.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
