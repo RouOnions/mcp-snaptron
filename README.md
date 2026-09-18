@@ -22,7 +22,7 @@ patterns across tens of thousands of RNA-seq samples." *Bioinformatics*
   `generate_gene_dossier` (plus a `list_available_analyses` fallback).
   Each tool writes a tidy per-sample CSV to `outputs/` and, where a matching
   R script exists, auto-generates a PNG chart in `plots/` via `Rscript`.
-- **`plot_*.R`** -- six standalone R/ggplot2 scripts, each reading a
+- **`plot_*.R`** -- seven standalone R/ggplot2 scripts, each reading a
   tool's output CSV and rendering one PNG. Callable directly:
   `Rscript plot_tissue_expression.R <csv_path> [gene_name]`.
   `plot_stratified_comparison_single_scope.R` (values as called, one
@@ -30,6 +30,8 @@ patterns across tens of thousands of RNA-seq samples." *Bioinformatics*
   `plot_stratified_comparison.R` (two scopes side by side, for the
   cancer-type-confound point) is not wired into any tool -- it takes two
   separate `stratified_comparison` calls' CSVs directly.
+  `plot_exon_usage_by_field.R` (heatmap: exon x group value) is wired
+  into `exon_usage`'s `comparison="field"` mode.
 - **`html_gene_dossier.py`** -- generates one self-contained, interactive
   HTML "dossier" per gene (GTEx tissue ranking, TCGA pan-cancer and
   per-cancer-type tumor/normal, an auto-generated narrative, exon- and
@@ -107,6 +109,14 @@ result = s.gene_tumor_vs_normal_impl("MKI67")
 # (avoids the pan-cancer pooling confound -- see docs/plot-notes.md)?
 result = s.stratified_comparison_impl(
     "MKI67", "cgc_case_pathologic_stage", ["Stage I", "Stage IV"],
+    extra_field="gdc_cases.project.project_id", extra_value="KIRC",
+)
+
+# Same idea at exon resolution -- which exons of a gene shift with stage,
+# within one cancer type:
+result = s.exon_usage_impl(
+    "FGFR2", comparison="field", field="cgc_case_pathologic_stage",
+    values=["Stage I", "Stage II", "Stage III", "Stage IV"],
     extra_field="gdc_cases.project.project_id", extra_value="KIRC",
 )
 ```

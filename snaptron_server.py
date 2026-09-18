@@ -1444,6 +1444,37 @@ def _fetch_tcga_exons_rows(gene: str, sample_type_value: str) -> tuple[list[list
     return rows, notes
 
 
+def _fetch_tcga_exons_rows_multi(gene: str, filters: list[tuple[str, str]], label: str) -> tuple[list[list[str]], list[str]]:
+    """Fetch /tcgav2/exons filtered by one or more field:value sfilter
+    constraints (ANDed together via repeated sfilter params -- same
+    confirmed-live mechanism stratified_comparison uses for genes) and
+    return positionally-parsed rows. Generalizes _fetch_tcga_exons_rows
+    beyond the hardcoded cgc_sample_sample_type field."""
+    notes: list[str] = []
+    sfilters = [("sfilter", f"{field}:{value}") for field, value in filters]
+    try:
+        body = fetch_snaptron("tcgav2", "exons", gene, filters=sfilters)
+    except RuntimeError as exc:
+        notes.append(f"{label}: query failed -- {exc}")
+        return [], notes
+
+    lines = [line for line in body.split("\n") if line.strip()]
+    if not lines:
+        notes.append(f"{label}: no rows returned")
+        return [], notes
+
+    data_lines = lines[1:]  # line 0 is the known-broken /exons header -- always discard
+    rows = [line.split("\t") for line in data_lines]
+    bad_rows = [r for r in rows if len(r) != EXONS_EXPECTED_FIELD_COUNT]
+    if bad_rows:
+        notes.append(
+            f"{label}: {len(bad_rows)} of {len(rows)} /exons rows did not have "
+            f"the expected {EXONS_EXPECTED_FIELD_COUNT} fields -- dropped rather than guessed at"
+        )
+    rows = [r for r in rows if len(r) == EXONS_EXPECTED_FIELD_COUNT]
+    return rows, notes
+
+
 def _split_packed_exon_id(packed: str) -> tuple[str, str, str, str]:
     """Split /exons' packed identifier column. Unlike /genes' 4-field
     gene_id:gene_name:gene_type:bp_length, /exons repeats gene_id: 5 fields,
@@ -1704,7 +1735,143 @@ def _exon_usage_tissue(gene: str, is_region_query: bool, notes: list[str]) -> di
     }
 
 
-def exon_usage_impl(gene: str, comparison: str = "tumor_vs_normal") -> dict:
+def _exon_usage_field(
+    gene: str,
+    field: str,
+    values: list[str],
+    extra_field: str | None,
+    extra_value: str | None,
+    is_region_query: bool,
+    notes: list[str],
+) -> dict:
+    """comparison="field": exon-level coverage across an arbitrary set of
+    values of a clinical/pathology field (e.g. tumor stage), optionally
+    constrained to one TCGA project via extra_field/extra_value --
+    generalizes exon_usage beyond the fixed tumor/normal split, the same
+    way stratified_comparison generalizes gene_tumor_vs_normal. Built from
+    the same low-level helpers (_fetch_tcga_exons_rows_multi,
+    _split_packed_exon_id) used elsewhere in this file, not a
+    reimplementation."""
+    has_extra_constraint = bool(extra_field and extra_value)
+
+    def build_filters(value: str) -> list[tuple[str, str]]:
+        filters = [(field, value)]
+        if has_extra_constraint:
+            filters.append((extra_field, extra_value))
+        return filters
+
+    per_value_rows: dict[str, list[list[str]]] = {}
+    for value in values:
+        rows, value_notes = _fetch_tcga_exons_rows_multi(gene, build_filters(value), value)
+        notes.extend(value_notes)
+        per_value_rows[value] = rows
+
+    exon_data: dict[str, dict] = {}
+    per_sample_rows: list[dict] = []
+    genes_found: set[str] = set()
+
+    for value, rows in per_value_rows.items():
+        for r in rows:
+            chromosome, start, end, strand = r[2], r[3], r[4], r[6]
+            packed_id, samples_str = r[11], r[12]
+            gene_id, gene_name, gene_type, _bp_length = _split_packed_exon_id(packed_id)
+            if not is_region_query and gene_name.upper() != gene.upper():
+                continue  # neighboring gene's exon overlapping the same span -- skip
+            genes_found.add(gene_name)
+
+            try:
+                start_i, end_i = int(start), int(end)
+                samples_count = int(r[13])
+                coverage_avg = float(r[15])
+                coverage_median = float(r[16])
+            except (ValueError, TypeError):
+                notes.append(f"{value}: could not parse a row for exon {chromosome}:{start}-{end}, skipping")
+                continue
+
+            exon_key = f"{chromosome}:{start_i}-{end_i}"
+            entry = exon_data.setdefault(
+                exon_key,
+                {
+                    "exon": exon_key,
+                    "chromosome": chromosome,
+                    "start": start_i,
+                    "end": end_i,
+                    "strand": strand,
+                    "gene_id": gene_id,
+                    "gene_name": gene_name,
+                    "gene_type": gene_type,
+                    "value_summary": [],
+                },
+            )
+            entry["value_summary"].append(
+                {
+                    "value": value,
+                    "samples_count": samples_count,
+                    "coverage_avg": coverage_avg,
+                    "coverage_median": coverage_median,
+                }
+            )
+
+            for rail_id, coverage in parse_samples_column(samples_str):
+                per_sample_rows.append({"exon": exon_key, "group": value, "rail_id": rail_id, "coverage": coverage})
+
+    # value_summary keeps the CALLER's order (values as passed), not sorted by
+    # magnitude -- same choice stratified_comparison/plot_stratified_comparison_single_scope.R
+    # make, appropriate when values have a natural progression (e.g. stage).
+    exon_summary = sorted(exon_data.values(), key=lambda e: e["start"])
+
+    resolved_gene = ", ".join(sorted(genes_found)) if is_region_query else gene
+    if is_region_query and not genes_found:
+        notes.append(f"{gene}: no annotated gene found overlapping this region")
+
+    csv_filename_gene = re.sub(r"[^A-Za-z0-9._-]", "_", gene)
+    csv_prefix = f"exon_usage_field_{csv_filename_gene}_{field}"
+    if has_extra_constraint:
+        csv_prefix += f"_within_{extra_value}"
+    csv_prefix = re.sub(r"[^A-Za-z0-9._-]", "_", csv_prefix)
+    csv_path = write_tidy_csv(per_sample_rows, csv_prefix)
+
+    plot_png_path = None
+    if csv_path:
+        plot_title = f"{gene} exon usage by {field}" + (f" within {extra_value}" if has_extra_constraint else "")
+        plot_png_path, plot_note = run_plot_script(
+            "plot_exon_usage_by_field.R", [csv_path, "group", plot_title]
+        )
+        notes.append(plot_note)
+
+    return {
+        "gene": resolved_gene or None,
+        "query": gene,
+        "comparison": "field",
+        "field": field,
+        "values": values,
+        "extra_constraint": {"field": extra_field, "value": extra_value} if has_extra_constraint else None,
+        "compilation": "tcgav2",
+        "exon_summary": exon_summary,
+        "per_sample_csv_path": csv_path,
+        "per_sample_csv_columns": ["exon", "group", "rail_id", "coverage"],
+        "plot_png_path": plot_png_path,
+        "notes": notes,
+        "field_nomenclature_caveat": (
+            f"Not all cancer types share the same clinical-field nomenclature or even use "
+            f"the same field at all -- '{field}' values that work for one cancer type can "
+            f"return 0 samples for every value in another (confirmed: TCGA-PRAD does not "
+            f"populate cgc_case_pathologic_stage at all, uses cgc_case_pathologic_t instead "
+            f"-- see CLAUDE.md). Always check each value's samples_count for the SPECIFIC "
+            f"cancer type before trusting a result."
+        ),
+        "normalization_caveat": NORMALIZATION_CAVEAT,
+    }
+
+
+def exon_usage_impl(
+    gene: str,
+    comparison: str = "tumor_vs_normal",
+    field: str | None = None,
+    values: list[str] | None = None,
+    extra_field: str | None = None,
+    extra_value: str | None = None,
+) -> dict:
     """Implementation, kept separate from the @mcp.tool wrapper for direct
     testability (see gene_expression_across_tissues_impl for why).
 
@@ -1722,9 +1889,19 @@ def exon_usage_impl(gene: str, comparison: str = "tumor_vs_normal") -> dict:
     tissues, ranked by coverage_median descending), including the same
     Blood/Blood Vessel sfilter word-match correction tool 1 applies (see
     GTEX_SMTS_WORD_MATCH_CAVEAT) -- that collision is a property of sfilter
-    itself, not of /genes specifically, so it applies here too."""
-    if comparison not in ("tumor_vs_normal", "tissue"):
-        raise ValueError(f"Unsupported comparison '{comparison}' -- must be 'tumor_vs_normal' or 'tissue'.")
+    itself, not of /genes specifically, so it applies here too.
+    "field" (tcgav2) mirrors stratified_comparison -- one entry per exon
+    with a nested value_summary list across caller-supplied `values` of a
+    caller-supplied clinical/pathology `field` (e.g. tumor stage), optionally
+    constrained to one TCGA project via extra_field/extra_value. Requires
+    `field` and `values`; generalizes tumor_vs_normal beyond the fixed
+    cgc_sample_sample_type split."""
+    if comparison not in ("tumor_vs_normal", "tissue", "field"):
+        raise ValueError(
+            f"Unsupported comparison '{comparison}' -- must be 'tumor_vs_normal', 'tissue', or 'field'."
+        )
+    if comparison == "field" and (not field or not values):
+        raise ValueError("comparison='field' requires both 'field' and 'values' to be provided.")
 
     gene = gene.strip()
     is_region_query = _looks_like_region(gene)
@@ -1738,16 +1915,33 @@ def exon_usage_impl(gene: str, comparison: str = "tumor_vs_normal") -> dict:
 
     if comparison == "tumor_vs_normal":
         return _exon_usage_tumor_vs_normal(gene, is_region_query, notes)
-    return _exon_usage_tissue(gene, is_region_query, notes)
+    if comparison == "tissue":
+        return _exon_usage_tissue(gene, is_region_query, notes)
+    return _exon_usage_field(gene, field, values, extra_field, extra_value, is_region_query, notes)
 
 
 @mcp.tool()
-def exon_usage(gene: str, comparison: str = "tumor_vs_normal") -> dict:
-    """Compare a gene's per-exon coverage, either between TCGA tumor and
-    normal (comparison="tumor_vs_normal", default, compilation tcgav2) or
-    across the full 31-tissue GTEx panel (comparison="tissue", compilation
-    gtexv2, same tissue list and Blood-collision correction as
-    gene_expression_across_tissues).
+def exon_usage(
+    gene: str,
+    comparison: str = "tumor_vs_normal",
+    field: str | None = None,
+    values: list[str] | None = None,
+    extra_field: str | None = None,
+    extra_value: str | None = None,
+) -> dict:
+    """Compare a gene's per-exon coverage, across three modes:
+    - comparison="tumor_vs_normal" (default, compilation tcgav2): TCGA
+      tumor vs normal.
+    - comparison="tissue" (compilation gtexv2): the full 31-tissue GTEx
+      panel, same tissue list and Blood-collision correction as
+      gene_expression_across_tissues.
+    - comparison="field" (compilation tcgav2): exon usage across arbitrary
+      values of an arbitrary clinical/pathology field (e.g. tumor stage),
+      mirroring stratified_comparison. Requires `field` (e.g.
+      "cgc_case_pathologic_stage") and `values` (e.g. ["Stage I", "Stage
+      IV"]); optionally constrain to one TCGA project with `extra_field`
+      (e.g. "gdc_cases.project.project_id") and `extra_value` (e.g. "KIRC")
+      to avoid the pan-cancer pooling confound.
 
     `gene` accepts a gene symbol (e.g. "MKI67") OR a raw region (e.g.
     "chr10:128096659-128099255", format chr:start-end) -- confirmed live
@@ -1756,22 +1950,30 @@ def exon_usage(gene: str, comparison: str = "tumor_vs_normal") -> dict:
     "query" echoes back exactly what was passed in.
 
     Queries /{compilation}/exons once per group (2 groups for
-    tumor_vs_normal, 31 tissues for tissue), parsed POSITIONALLY rather
-    than via header (the /exons endpoint returns a malformed header -- one
-    declared field vs 18 actual data fields per row -- confirmed live; see
-    the comment above EXONS_EXPECTED_FIELD_COUNT). Returns one entry per
-    exon (ordered by genomic position): tumor_vs_normal gives each exon
-    flat tumor_*/normal_* fields; tissue gives each exon a nested
-    tissue_summary list ranked by coverage_median. Also returns the
-    absolute path to a per-sample CSV (columns: exon, group, rail_id,
-    coverage) for further analysis/plotting in R.
+    tumor_vs_normal, 31 tissues for tissue, one per value for field),
+    parsed POSITIONALLY rather than via header (the /exons endpoint
+    returns a malformed header -- one declared field vs 18 actual data
+    fields per row -- confirmed live; see the comment above
+    EXONS_EXPECTED_FIELD_COUNT). Returns one entry per exon (ordered by
+    genomic position): tumor_vs_normal gives each exon flat
+    tumor_*/normal_* fields; tissue and field give each exon a nested
+    tissue_summary/value_summary list. Also returns the absolute path to a
+    per-sample CSV (columns: exon, group, rail_id, coverage) for further
+    analysis/plotting in R -- comparison="field" auto-generates a heatmap
+    via plot_exon_usage_by_field.R.
 
     This is exon-level COVERAGE comparison, not DEXSeq-grade differential
     exon usage (which would need relative-inclusion-rate modeling
     accounting for overall gene expression change) -- label any output
-    accordingly.
+    accordingly. Not every clinical field applies to every cancer type
+    (see field_nomenclature_caveat in the field-mode result, and
+    CLAUDE.md) -- always check each value's samples_count before trusting
+    a result.
     """
-    return exon_usage_impl(gene, comparison=comparison)
+    return exon_usage_impl(
+        gene, comparison=comparison, field=field, values=values,
+        extra_field=extra_field, extra_value=extra_value,
+    )
 
 
 # ---------------------------------------------------------------------------
